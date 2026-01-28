@@ -35,6 +35,10 @@
     </div>
 
     <div class="bottom-panel">
+      <div class="viewer-links">
+        <router-link class="viewer-link" to="/viewer">WebRTC 观看端</router-link>
+        <router-link class="viewer-link" to="/sender">WebRTC 发送端</router-link>
+      </div>
       <button class="mode-btn" @click="toggleMode">
         {{ currentMode === 'edit' ? '当前：编辑' : '当前：执行' }}
       </button>
@@ -632,6 +636,19 @@ function updateParticles() {
   z-index: 30;
   max-width: 95vw;
   white-space: nowrap;
+}
+
+.viewer-links {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.viewer-link {
+  color: #7de3ff;
+  text-decoration: none;
+  font-size: 12px;
+  letter-spacing: 0.5px;
 }
 
 .mode-btn {
