@@ -1,6 +1,14 @@
-# cowfarm
+# cowfarm route editor
 
-This template should help get you started developing with Vue 3 in Vite.
+This repository is the standalone route editor for the calf feeding robot. The official deployment entry is now the 5173 admin service in `calf-routeConfig-web`; this app keeps the same path-task and WebRTC contracts for local editing or fallback use.
+
+Default integration endpoints:
+
+- Route task submit: `POST http://120.48.24.192:5173/api/pathSettings`
+- Device status: `GET http://120.48.24.192:5173/api/webget?deviceID=robot001`
+- WebRTC viewer signaling: `ws://120.48.24.192:5173/ws/browser`
+
+Use `VITE_API_BASE_URL` and `VITE_SIGNAL_URL` to point the standalone app at another server.
 
 ## Recommended IDE Setup
 

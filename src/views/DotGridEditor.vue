@@ -36,6 +36,15 @@
 
     <div class="bottom-panel">
       <router-link class="viewer-link" to="/viewer">WebRTC 观看端</router-link>
+      <div class="api-panel">
+        <label>服务<input v-model="apiBase" class="api-input wide" placeholder="http://120.48.24.192:5173" /></label>
+        <label>设备<input v-model="deviceID" class="api-input" /></label>
+        <label>米/格<input v-model.number="gridScaleM" class="api-input short" type="number" step="0.1" /></label>
+        <label>投喂<input v-model.number="feedAmount" class="api-input short" type="number" /></label>
+        <button class="submit-btn" @click="submitCurrentRoute">下发路线</button>
+        <button @click="refreshDeviceStatus">状态</button>
+        <span class="api-message">{{ apiMessage }}</span>
+      </div>
       <button class="mode-btn" @click="toggleMode">
         {{ currentMode === 'edit' ? '当前：编辑' : '当前：执行' }}
       </button>
@@ -127,6 +136,11 @@ const routes = ref([]);
 const activeRouteIdx = ref(0);
 const points = ref({}); 
 const historyStack = ref([]); 
+const apiBase = ref(import.meta.env.VITE_API_BASE_URL || (window.location.hostname === '120.48.24.192' ? window.location.origin : 'http://120.48.24.192:5173'));
+const deviceID = ref('robot001');
+const gridScaleM = ref(0.5);
+const feedAmount = ref(500);
+const apiMessage = ref('等待下发路径');
 
 let animationFrameId = null;
 const particles = ref([]); 
@@ -478,6 +492,69 @@ function importData(e) {
   e.target.value = '';
 }
 
+function buildApiUrl(path) {
+  return `${String(apiBase.value || '').replace(/\/$/, '')}${path}`;
+}
+
+function orderedPointKeys(route) {
+  if (!route || route.connections.length === 0) {
+    return lastClickedPoint ? [lastClickedPoint] : [];
+  }
+  return [route.connections[0].from, ...route.connections.map(conn => conn.to)];
+}
+
+function pathPoint(key, index, total) {
+  const [row, col] = key.split(',').map(Number);
+  const action = index === 0 ? 'start' : index === total - 1 ? 'feed' : 'pass';
+  const point = {
+    seq: index + 1,
+    row,
+    col,
+    x: Number((col * Number(gridScaleM.value || 0.5)).toFixed(3)),
+    y: Number((row * Number(gridScaleM.value || 0.5)).toFixed(3)),
+    action
+  };
+  if (action === 'feed') point.feedAmount = Number(feedAmount.value || 0);
+  return point;
+}
+
+async function submitCurrentRoute() {
+  const route = routes.value[activeRouteIdx.value];
+  const keys = orderedPointKeys(route);
+  if (keys.length === 0) {
+    apiMessage.value = '当前路线没有路径点';
+    return;
+  }
+  const task = {
+    taskID: `task-${Date.now()}`,
+    deviceID: deviceID.value,
+    gridScaleM: Number(gridScaleM.value || 0.5),
+    robotPath: keys.map((key, index) => pathPoint(key, index, keys.length))
+  };
+  try {
+    const response = await fetch(buildApiUrl('/api/pathSettings'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(task)
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    apiMessage.value = `已下发 ${keys.length} 个路径点`;
+  } catch (error) {
+    apiMessage.value = `下发失败: ${error}`;
+  }
+}
+
+async function refreshDeviceStatus() {
+  try {
+    const response = await fetch(buildApiUrl(`/api/webget?deviceID=${encodeURIComponent(deviceID.value)}`));
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    apiMessage.value = JSON.stringify(data.data || data);
+  } catch (error) {
+    apiMessage.value = `状态失败: ${error}`;
+  }
+}
+
 // ==========================================
 // 7. 动画
 // ==========================================
@@ -641,6 +718,41 @@ function updateParticles() {
   font-size: 12px;
   letter-spacing: 0.5px;
 }
+
+.api-panel {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  max-width: 92vw;
+  color: #aaa;
+  font-size: 12px;
+}
+
+.api-panel label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.api-input {
+  width: 88px;
+  background: #111;
+  border: 1px solid #444;
+  color: #fff;
+  padding: 4px 6px;
+  border-radius: 3px;
+}
+
+.api-input.wide { width: 220px; }
+.api-input.short { width: 58px; }
+.api-message {
+  max-width: 360px;
+  overflow: hidden;
+  color: #9ee7ff;
+  text-overflow: ellipsis;
+}
+.submit-btn { background: #256; }
 
 .mode-btn {
   background: #222; border: 1px dashed #666; color: #ddd; padding: 6px; border-radius: 4px; cursor: pointer; font-size: 12px;

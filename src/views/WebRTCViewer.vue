@@ -1,58 +1,48 @@
 <template>
   <div class="viewer-root">
     <header class="viewer-header">
-      <div class="title">
+      <div>
         <h1>WebRTC 观看端</h1>
-        <p>连接服务器端渲染后的视频流</p>
+        <p>接收板卡原始视频，在浏览器叠加识别框</p>
       </div>
       <router-link class="back-link" to="/">返回编辑器</router-link>
     </header>
 
-    <section class="panel">
-      <div class="field">
-        <label>信令 WebSocket</label>
-        <input v-model="signalUrl" type="text" placeholder="ws://server:port/ws" />
-      </div>
-      <div class="field">
-        <label>设备 ID（可选）</label>
-        <input v-model="deviceId" type="text" placeholder="robot-001" />
-      </div>
-      <div class="field">
-        <label>ICE Servers（可选，逗号分隔）</label>
-        <input v-model="iceServersInput" type="text" placeholder="stun:stun.l.google.com:19302" />
-      </div>
-      <div class="field checkbox">
-        <label>
-          <input v-model="clientOffers" type="checkbox" />
-          浏览器主动发起 Offer
-        </label>
-      </div>
-      <div class="actions">
-        <button class="primary" :disabled="isConnecting || isConnected" @click="connect">
-          {{ isConnecting ? '连接中...' : '连接' }}
-        </button>
-        <button class="ghost" :disabled="!isConnected && !isConnecting" @click="disconnect">断开</button>
-      </div>
-      <div class="status">
-        <span :class="['dot', statusClass]"></span>
-        <span>{{ statusText }}</span>
-      </div>
+    <section class="panel controls">
+      <label>信令 WebSocket<input v-model="signalUrl" /></label>
+      <label>设备 ID<input v-model="deviceId" /></label>
+      <label>ICE Servers<input v-model="iceServersInput" placeholder="stun:stun.l.google.com:19302" /></label>
+      <button class="primary" :disabled="isConnecting || isConnected" @click="connect">
+        {{ isConnecting ? '连接中...' : '连接' }}
+      </button>
+      <button :disabled="!isConnected && !isConnecting" @click="disconnect">断开</button>
+      <button @click="refreshStatus">状态</button>
+      <span :class="['dot', statusClass]"></span>
+      <span>{{ statusText }}</span>
     </section>
 
     <section class="stage">
-      <video ref="videoRef" autoplay playsinline muted></video>
-      <div class="hint" v-if="!isConnected">未连接，点击“连接”开始</div>
+      <video ref="videoRef" autoplay playsinline muted @loadedmetadata="drawOverlay"></video>
+      <canvas ref="overlayRef"></canvas>
+      <div class="hint" v-if="!isConnected">等待浏览器连接信令和板卡 offer</div>
     </section>
 
-    <section class="panel logs">
-      <div class="log-header">
-        <span>日志</span>
-        <button class="ghost" @click="clearLogs">清空</button>
+    <section class="info-grid">
+      <div class="panel">
+        <h2>检测元数据</h2>
+        <pre>{{ JSON.stringify(metadata || {}, null, 2) }}</pre>
       </div>
-      <div class="log-list">
-        <div v-for="(item, idx) in logs" :key="idx" class="log-item">
-          <span class="time">{{ item.time }}</span>
-          <span class="msg">{{ item.msg }}</span>
+      <div class="panel">
+        <h2>设备状态</h2>
+        <pre>{{ statusPayload }}</pre>
+      </div>
+      <div class="panel logs">
+        <div class="log-header">
+          <h2>日志</h2>
+          <button @click="logs = []">清空</button>
+        </div>
+        <div class="log-list">
+          <div v-for="(item, idx) in logs" :key="idx">{{ item }}</div>
         </div>
       </div>
     </section>
@@ -60,17 +50,24 @@
 </template>
 
 <script setup>
-import { ref, onUnmounted, computed } from 'vue'
+import { ref, onUnmounted, computed, watch } from 'vue'
 
-const signalUrl = ref('')
-const deviceId = ref('')
+const defaultSignalUrl = () => {
+  const base = import.meta.env.VITE_SIGNAL_URL || 'ws://120.48.24.192:5173/ws/browser'
+  return base
+}
+
+const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://120.48.24.192:5173'
+const signalUrl = ref(defaultSignalUrl())
+const deviceId = ref('robot001')
 const iceServersInput = ref('')
-const clientOffers = ref(true)
-
 const isConnected = ref(false)
 const isConnecting = ref(false)
 const logs = ref([])
+const metadata = ref(null)
+const statusPayload = ref('{}')
 const videoRef = ref(null)
+const overlayRef = ref(null)
 
 let ws = null
 let pc = null
@@ -86,125 +83,99 @@ const statusClass = computed(() => {
 })
 
 function log(msg) {
-  const now = new Date()
-  const time = now.toLocaleTimeString('zh-CN', { hour12: false })
-  logs.value.unshift({ time, msg })
-  if (logs.value.length > 200) logs.value.length = 200
-}
-
-function clearLogs() {
-  logs.value = []
+  const time = new Date().toLocaleTimeString('zh-CN', { hour12: false })
+  logs.value.unshift(`${time} ${msg}`)
+  if (logs.value.length > 160) logs.value.length = 160
 }
 
 function parseIceServers() {
-  const urls = iceServersInput.value
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
-  if (urls.length === 0) return undefined
-  return [{ urls }]
+  const urls = iceServersInput.value.split(',').map(s => s.trim()).filter(Boolean)
+  return urls.length ? [{ urls }] : undefined
+}
+
+function send(payload) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ from: 'browser', to: 'python', ...payload }))
+  }
+}
+
+function ensurePeer() {
+  if (pc) return pc
+  pc = new RTCPeerConnection({ iceServers: parseIceServers() })
+  pc.ontrack = (event) => {
+    const [stream] = event.streams
+    if (videoRef.value && stream) videoRef.value.srcObject = stream
+  }
+  pc.onicecandidate = (event) => {
+    if (!event.candidate) return
+    send({
+      type: 'candidate',
+      candidate: event.candidate.candidate,
+      sdpMid: event.candidate.sdpMid,
+      sdpMLineIndex: event.candidate.sdpMLineIndex
+    })
+  }
+  pc.onconnectionstatechange = () => {
+    log(`Peer ${pc.connectionState}`)
+    isConnected.value = pc.connectionState === 'connected' || Boolean(ws)
+  }
+  pc.ondatachannel = (event) => {
+    event.channel.onmessage = (dataEvent) => {
+      try {
+        metadata.value = JSON.parse(String(dataEvent.data))
+      } catch {
+        log('metadata 解析失败')
+      }
+    }
+    log(`DataChannel ${event.channel.label}`)
+  }
+  return pc
+}
+
+async function handleSignal(raw) {
+  const msg = JSON.parse(raw)
+  if (msg.type === 'offer' && msg.sdp) {
+    const peer = ensurePeer()
+    await peer.setRemoteDescription({ type: 'offer', sdp: msg.sdp })
+    const answer = await peer.createAnswer()
+    await peer.setLocalDescription(answer)
+    send({ type: 'answer', sdp: peer.localDescription.sdp })
+    log('收到 offer 并回复 answer')
+  } else if (msg.type === 'candidate' && msg.candidate) {
+    await pc?.addIceCandidate({
+      candidate: msg.candidate,
+      sdpMid: msg.sdpMid,
+      sdpMLineIndex: msg.sdpMLineIndex
+    })
+  } else if (msg.type === 'ping') {
+    send({ type: 'pong' })
+  }
 }
 
 async function connect() {
-  if (!signalUrl.value) {
-    log('请填写信令 WebSocket 地址')
-    return
-  }
   await disconnect()
   isConnecting.value = true
-
-  const url = deviceId.value
-    ? `${signalUrl.value}${signalUrl.value.includes('?') ? '&' : '?'}deviceId=${encodeURIComponent(deviceId.value)}`
-    : signalUrl.value
-
-  ws = new WebSocket(url)
-
-  ws.onopen = async () => {
-    log(`信令已连接: ${url}`)
-    pc = new RTCPeerConnection({ iceServers: parseIceServers() })
-
-    pc.ontrack = (event) => {
-      const [stream] = event.streams
-      if (videoRef.value && stream) {
-        videoRef.value.srcObject = stream
-      }
-    }
-
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        ws.send(JSON.stringify({
-          type: 'candidate',
-          candidate: event.candidate.candidate,
-          sdpMid: event.candidate.sdpMid,
-          sdpMLineIndex: event.candidate.sdpMLineIndex
-        }))
-      }
-    }
-
-    pc.onconnectionstatechange = () => {
-      log(`连接状态: ${pc.connectionState}`)
-      isConnected.value = pc.connectionState === 'connected'
-      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-        isConnected.value = false
-      }
-    }
-
-    pc.addTransceiver('video', { direction: 'recvonly' })
-
-    if (clientOffers.value) {
-      const offer = await pc.createOffer()
-      await pc.setLocalDescription(offer)
-      ws.send(JSON.stringify({ type: 'offer', sdp: pc.localDescription.sdp }))
-      log('已发送 offer')
-    }
-
+  ws = new WebSocket(signalUrl.value)
+  ws.onopen = () => {
     isConnecting.value = false
+    isConnected.value = true
+    log(`信令已连接: ${signalUrl.value}`)
   }
-
-  ws.onmessage = async (event) => {
-    try {
-      const msg = JSON.parse(event.data)
-      if (msg.type === 'answer' && msg.sdp) {
-        await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp })
-        log('收到 answer')
-      } else if (msg.type === 'offer' && msg.sdp) {
-        await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp })
-        const answer = await pc.createAnswer()
-        await pc.setLocalDescription(answer)
-        ws.send(JSON.stringify({ type: 'answer', sdp: pc.localDescription.sdp }))
-        log('收到 offer 并回复 answer')
-      } else if (msg.type === 'candidate' && msg.candidate) {
-        await pc.addIceCandidate({
-          candidate: msg.candidate,
-          sdpMid: msg.sdpMid,
-          sdpMLineIndex: msg.sdpMLineIndex
-        })
-      } else if (msg.type === 'ping') {
-        ws.send(JSON.stringify({ type: 'pong' }))
-      }
-    } catch (err) {
-      log(`信令消息解析失败: ${err}`)
-    }
-  }
-
+  ws.onmessage = (event) => handleSignal(String(event.data)).catch(err => log(String(err)))
   ws.onclose = () => {
+    isConnecting.value = false
+    isConnected.value = false
     log('信令连接已关闭')
-    isConnected.value = false
-    isConnecting.value = false
   }
-
   ws.onerror = () => {
-    log('信令连接错误')
-    isConnected.value = false
     isConnecting.value = false
+    log('信令连接错误')
   }
 }
 
 async function disconnect() {
   if (pc) {
-    pc.getSenders().forEach((sender) => {
-      try { sender.track && sender.track.stop() } catch { /* noop */ }
-    })
+    pc.getSenders().forEach(sender => sender.track && sender.track.stop())
     pc.close()
     pc = null
   }
@@ -212,26 +183,60 @@ async function disconnect() {
     ws.close()
     ws = null
   }
-  if (videoRef.value) {
-    videoRef.value.srcObject = null
-  }
+  if (videoRef.value) videoRef.value.srcObject = null
   isConnected.value = false
   isConnecting.value = false
 }
 
-onUnmounted(() => {
-  disconnect()
-})
+async function refreshStatus() {
+  try {
+    const url = `${apiBase.replace(/\/$/, '')}/api/webget?deviceID=${encodeURIComponent(deviceId.value)}`
+    const response = await fetch(url)
+    statusPayload.value = JSON.stringify(await response.json(), null, 2)
+  } catch (error) {
+    statusPayload.value = String(error)
+  }
+}
+
+function drawOverlay() {
+  const video = videoRef.value
+  const canvas = overlayRef.value
+  const ctx = canvas?.getContext('2d')
+  if (!video || !canvas || !ctx) return
+  const width = video.videoWidth || metadata.value?.image?.width || 1280
+  const height = video.videoHeight || metadata.value?.image?.height || 720
+  canvas.width = width
+  canvas.height = height
+  ctx.clearRect(0, 0, width, height)
+  ;(metadata.value?.detections || []).forEach((item) => {
+    const bbox = item.bbox
+    if (!bbox) return
+    const w = bbox.right - bbox.left
+    const h = bbox.bottom - bbox.top
+    ctx.strokeStyle = '#22d3ee'
+    ctx.lineWidth = 3
+    ctx.strokeRect(bbox.left, bbox.top, w, h)
+    ctx.fillStyle = 'rgba(8, 47, 73, 0.85)'
+    ctx.fillRect(bbox.left, Math.max(0, bbox.top - 24), Math.max(120, w), 24)
+    ctx.fillStyle = '#e0f2fe'
+    ctx.font = '16px sans-serif'
+    const score = item.score == null ? '' : ` ${(item.score * 100).toFixed(0)}%`
+    ctx.fillText(`${item.label || 'bucket'}${score}`, bbox.left + 6, Math.max(18, bbox.top - 6))
+  })
+}
+
+watch(metadata, drawOverlay)
+onUnmounted(() => disconnect())
 </script>
 
 <style scoped>
 .viewer-root {
   min-height: 100vh;
-  background: radial-gradient(circle at 20% 20%, #20262d, #0f1114 60%);
-  color: #f1f1f1;
-  padding: 24px;
+  background: #0f172a;
+  color: #f8fafc;
+  padding: 20px;
   display: grid;
-  gap: 18px;
+  gap: 16px;
 }
 
 .viewer-header {
@@ -240,161 +245,92 @@ onUnmounted(() => {
   align-items: center;
 }
 
-.viewer-header h1 {
-  margin: 0;
-  font-size: 28px;
-  letter-spacing: 0.5px;
-}
-
-.viewer-header p {
-  margin: 6px 0 0;
-  color: #9aa4b2;
-}
-
-.back-link {
-  color: #7de3ff;
-  text-decoration: none;
-  font-weight: 600;
-}
+.viewer-header h1 { margin: 0; font-size: 26px; }
+.viewer-header p { margin: 6px 0 0; color: #94a3b8; }
+.back-link { color: #67e8f9; text-decoration: none; font-weight: 600; }
 
 .panel {
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 12px;
-  padding: 16px;
-  display: grid;
-  gap: 12px;
-}
-
-.field {
-  display: grid;
-  gap: 6px;
-}
-
-.field label {
-  font-size: 12px;
-  color: #8f9aa8;
-}
-
-.field input {
-  background: #0f1419;
-  color: #f1f1f1;
-  border: 1px solid #27303a;
+  border: 1px solid rgba(255,255,255,0.12);
+  background: rgba(15,23,42,0.86);
   border-radius: 8px;
-  padding: 10px 12px;
+  padding: 14px;
 }
 
-.field.checkbox {
-  align-items: center;
-}
-
-.actions {
-  display: flex;
+.controls {
+  display: grid;
+  grid-template-columns: minmax(260px, 2fr) 160px minmax(220px, 1fr) repeat(3, auto) auto 80px;
   gap: 10px;
+  align-items: end;
+}
+
+label { display: grid; gap: 6px; color: #94a3b8; font-size: 12px; }
+input {
+  background: #020617;
+  border: 1px solid rgba(255,255,255,0.16);
+  color: #fff;
+  border-radius: 6px;
+  padding: 8px 10px;
 }
 
 button {
-  border: none;
-  padding: 10px 16px;
-  border-radius: 8px;
-  font-weight: 600;
+  border: 0;
+  border-radius: 6px;
+  background: #334155;
+  color: white;
+  padding: 9px 14px;
   cursor: pointer;
 }
+button.primary { background: #06b6d4; color: #082f49; font-weight: 700; }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
 
-button.primary {
-  background: #2dd4ff;
-  color: #0b0f12;
-}
-
-button.ghost {
-  background: transparent;
-  color: #c2cbd6;
-  border: 1px solid #2b3742;
-}
-
-.status {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 13px;
-  color: #c2cbd6;
-}
-
-.dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  display: inline-block;
-  background: #2b3742;
-}
-
-.dot.ok {
-  background: #3ddc84;
-}
-
-.dot.pending {
-  background: #fbbf24;
-}
+.dot { width: 10px; height: 10px; border-radius: 999px; background: #64748b; display: inline-block; }
+.dot.pending { background: #facc15; }
+.dot.ok { background: #22c55e; }
 
 .stage {
   position: relative;
-  background: #0b0f12;
-  border-radius: 16px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  min-height: 360px;
-  display: grid;
-  place-items: center;
+  min-height: 58vh;
+  background: #000;
   overflow: hidden;
+  border-radius: 8px;
 }
 
-.stage video {
+video,
+canvas {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
   object-fit: contain;
-  background: #000;
 }
 
 .hint {
   position: absolute;
-  color: #9aa4b2;
-  font-size: 14px;
-}
-
-.logs {
-  max-height: 220px;
-  overflow: hidden;
-}
-
-.log-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.log-list {
-  max-height: 160px;
-  overflow: auto;
+  inset: 0;
   display: grid;
-  gap: 6px;
+  place-items: center;
+  color: #94a3b8;
+}
+
+.info-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 16px;
+}
+
+h2 { margin: 0 0 10px; font-size: 15px; }
+pre {
+  margin: 0;
+  max-height: 240px;
+  overflow: auto;
+  color: #cbd5e1;
   font-size: 12px;
 }
+.log-header { display: flex; justify-content: space-between; align-items: center; }
+.log-list { max-height: 220px; overflow: auto; color: #cbd5e1; font-size: 12px; }
 
-.log-item {
-  display: grid;
-  grid-template-columns: 80px 1fr;
-  gap: 8px;
-  color: #c8d1dc;
-}
-
-.log-item .time {
-  color: #7b8794;
-}
-
-@media (max-width: 960px) {
-  .viewer-header {
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 8px;
-  }
+@media (max-width: 900px) {
+  .controls,
+  .info-grid { grid-template-columns: 1fr; }
 }
 </style>
